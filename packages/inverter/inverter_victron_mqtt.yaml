@@ -1,5 +1,5 @@
 # Updated : 2025.12.23
-# Version : 1.0.0
+# Version : 1.1.0
 # GitHub  : https://github.com/Sleeper85/esphome-yambms
 
 # +--------------------------------------+
@@ -52,6 +52,48 @@
 substitutions:
   victron_mqtt_topic: "yambms/victron/battery"
   victron_update_interval: "1s"
+  victron_heartbeat_topic: "yambms/victron/heartbeat"
+  victron_timeout: "30s"  # Stop publishing if MQTT offline
+
+# +--------------------------------------+
+# | Heartbeat & Connection Monitoring    |
+# +--------------------------------------+
+#
+# IMPORTANT DIFFERENCE FROM CAN BUS:
+#
+# CAN Bus (bidirectional):
+#   - Inverter sends 0x305 ACK to YamBMS
+#   - YamBMS stops sending if no ACK received
+#   - Explicit handshake mechanism
+#
+# MQTT/Victron (unidirectional):
+#   - YamBMS publishes to MQTT topic
+#   - Victron subscribes and reads data
+#   - No ACK from Victron to YamBMS
+#   - MQTT broker handles offline clients
+#
+# This implementation adds monitoring to provide similar functionality:
+#   - Tracks MQTT broker connectivity
+#   - Monitors publish success/failure
+#   - Provides status feedback to user
+#   - Can disable publishing if broker offline (optional)
+
+globals:
+  - id: victron_publish_enabled
+    type: bool
+    initial_value: "true"
+
+  - id: victron_last_publish_ms
+    type: unsigned long
+    initial_value: "0"
+
+  - id: victron_publish_count
+    type: unsigned long
+    initial_value: "0"
+
+  - id: victron_publish_error_count
+    type: unsigned long
+    initial_value: "0"
 
 # +--------------------------------------+
 # | Victron Data Publishing              |
@@ -61,8 +103,22 @@ interval:
   - interval: ${victron_update_interval}
     then:
       - lambda: |-
+          // Check if publishing is enabled
+          if (!id(victron_publish_enabled)) {
+            ESP_LOGW("victron_mqtt", "Publishing disabled - MQTT broker offline");
+            return;
+          }
+
           // Only publish if YamBMS has combined BMS data
           if (id(${yambms_id}_bms_combined).state == 0) {
+            ESP_LOGD("victron_mqtt", "No BMS data to publish");
+            return;
+          }
+
+          // Check MQTT connection
+          if (!id(mqtt_client).is_connected()) {
+            ESP_LOGW("victron_mqtt", "MQTT disconnected - cannot publish");
+            id(victron_publish_error_count)++;
             return;
           }
 
@@ -137,12 +193,48 @@ interval:
           payload += "}";
 
           // Publish to Victron topic
-          id(mqtt_client).publish("${victron_mqtt_topic}", payload);
+          bool publish_success = id(mqtt_client).publish("${victron_mqtt_topic}", payload);
 
-          ESP_LOGI("victron_mqtt", "Published battery data: %.1fV %.1fA %d%% SOC",
-                   id(${yambms_id}_total_voltage).state,
-                   id(${yambms_id}_current).state,
-                   (int)id(${yambms_id}_battery_soc).state);
+          if (publish_success) {
+            id(victron_last_publish_ms) = millis();
+            id(victron_publish_count)++;
+
+            ESP_LOGI("victron_mqtt", "Published battery data: %.1fV %.1fA %d%% SOC",
+                     id(${yambms_id}_total_voltage).state,
+                     id(${yambms_id}_current).state,
+                     (int)id(${yambms_id}_battery_soc).state);
+          } else {
+            id(victron_publish_error_count)++;
+            ESP_LOGE("victron_mqtt", "Failed to publish battery data");
+          }
+
+  # Heartbeat monitoring (similar to CAN bus 0x305 ACK monitoring)
+  - interval: 5s
+    then:
+      - lambda: |-
+          // Check MQTT broker connectivity
+          bool mqtt_connected = id(mqtt_client).is_connected();
+
+          // Auto-disable publishing if MQTT offline for too long
+          unsigned long now = millis();
+          unsigned long last_publish = id(victron_last_publish_ms);
+
+          if (mqtt_connected && id(${yambms_id}_bms_combined).state > 0) {
+            // MQTT online and have data - enable publishing
+            if (!id(victron_publish_enabled)) {
+              ESP_LOGI("victron_mqtt", "MQTT reconnected - enabling publishing");
+              id(victron_publish_enabled) = true;
+            }
+          } else if (!mqtt_connected || (last_publish > 0 && (now - last_publish) > 30000)) {
+            // MQTT offline or no successful publish for 30 seconds - disable
+            if (id(victron_publish_enabled)) {
+              ESP_LOGW("victron_mqtt", "MQTT connection lost - disabling publishing");
+              id(victron_publish_enabled) = false;
+            }
+          }
+
+          // Publish status
+          id(victron_mqtt_active).publish_state(mqtt_connected && id(victron_publish_enabled));
 
 # +--------------------------------------+
 # | Status Monitoring                    |
@@ -154,10 +246,62 @@ binary_sensor:
     id: victron_mqtt_active
     icon: "mdi:transmission-tower"
     entity_category: diagnostic
+    # Published by heartbeat monitoring interval
+
+switch:
+  - platform: template
+    name: "Victron MQTT Publishing"
+    id: victron_publish_switch
+    icon: "mdi:publish"
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: false
     lambda: |-
-      // Active if MQTT connected and YamBMS has data
-      return id(mqtt_client).is_connected() &&
-             id(${yambms_id}_bms_combined).state > 0;
+      return id(victron_publish_enabled);
+    turn_on_action:
+      - lambda: |-
+          ESP_LOGI("victron_mqtt", "Publishing enabled by user");
+          id(victron_publish_enabled) = true;
+    turn_off_action:
+      - lambda: |-
+          ESP_LOGW("victron_mqtt", "Publishing disabled by user");
+          id(victron_publish_enabled) = false;
+
+sensor:
+  - platform: template
+    name: "Victron Publish Count"
+    id: victron_publish_count_sensor
+    icon: "mdi:counter"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    lambda: |-
+      return id(victron_publish_count);
+    update_interval: 10s
+
+  - platform: template
+    name: "Victron Publish Errors"
+    id: victron_publish_errors_sensor
+    icon: "mdi:alert-circle"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    lambda: |-
+      return id(victron_publish_error_count);
+    update_interval: 10s
+
+  - platform: template
+    name: "Victron Heartbeat Interval"
+    id: victron_heartbeat_interval_sensor
+    icon: "mdi:heart-pulse"
+    unit_of_measurement: "ms"
+    device_class: duration
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    lambda: |-
+      unsigned long now = millis();
+      unsigned long last = id(victron_last_publish_ms);
+      if (last == 0) return 0;
+      return now - last;
+    update_interval: 5s
 
 text_sensor:
   - platform: template
@@ -168,15 +312,26 @@ text_sensor:
       if (!id(mqtt_client).is_connected()) {
         return {"MQTT Disconnected"};
       }
+      if (!id(victron_publish_enabled)) {
+        return {"Publishing Disabled"};
+      }
       if (id(${yambms_id}_bms_combined).state == 0) {
         return {"No BMS Data"};
       }
-      char status[100];
+
+      unsigned long errors = id(victron_publish_error_count);
+      unsigned long successes = id(victron_publish_count);
+      float error_rate = (successes > 0) ? (errors * 100.0 / (successes + errors)) : 0;
+
+      char status[150];
       snprintf(status, sizeof(status),
-        "Publishing: %.1fV %.1fA %d%% SOC",
+        "Publishing: %.1fV %.1fA %d%% | Sent: %lu | Errors: %lu (%.1f%%)",
         id(${yambms_id}_total_voltage).state,
         id(${yambms_id}_current).state,
-        (int)id(${yambms_id}_battery_soc).state);
+        (int)id(${yambms_id}_battery_soc).state,
+        successes,
+        errors,
+        error_rate);
       return {status};
     update_interval: 10s
 
